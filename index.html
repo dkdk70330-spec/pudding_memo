@@ -661,7 +661,7 @@
     <div class="editor" id="editor">
       <pre id="highlight" aria-hidden="true"></pre>
       <textarea id="input" aria-label="프롬프트 편집기" spellcheck="false"></textarea>
-      <div class="hint">왼쪽 → 이동 · 본문의 최상위 [카테고리] 클릭 → 접기</div>
+      <div class="hint">왼쪽 → 이동 · [카테고리] 글자 클릭 → 접기 · 줄 뒤쪽 → 입력</div>
     </div>
   </main>
 
@@ -1129,8 +1129,11 @@ function sectionAtCaret(){
   const pos = input.selectionStart;
   const view = buildView(rawText);
 
+  /* 헤더 문자열 "안쪽"을 눌렀을 때만 접는다.
+     줄 끝의 빈 공간을 누르면 textarea의 caret이 headerEnd에 놓이므로,
+     그 경우에는 접지 않고 그대로 엔터/입력이 가능하다. */
   return view.meta.find(item =>
-    pos >= item.headerStart && pos <= item.headerEnd
+    pos >= item.headerStart && pos < item.headerEnd
   ) || null;
 }
 

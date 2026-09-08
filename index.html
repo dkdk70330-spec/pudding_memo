@@ -897,6 +897,10 @@ docVersion.value = safeStorage.get('prompt-doc-version') ?? '';
 let saveTimer = null;
 let lastHit = new Map();
 
+/* 접힌 |사용자 태그|의 이름을 편집할 때,
+   화면에서는 몸통이 숨겨져 있으므로 편집 직전의 몸통을 잠시 보관한다. */
+let pendingFoldedTagEdit = null;
+
 let history = [rawText];
 let historyIndex = 0;
 let restoringHistory = false;
@@ -995,10 +999,76 @@ function mergeVisibleIntoRaw(visibleText){
   const visibleParsed = parseText(visibleText);
 
   let merged = visibleParsed.prefix;
+  let migratedFold = null;
 
-  for(const section of visibleParsed.sections){
+  /* beforeinput이 없는 일부 모바일/IME 환경에서도 단순 제목 변경을
+     안전하게 복구할 수 있도록 섹션 수가 그대로인 경우 위치 기반 fallback을 쓴다. */
+  const indexRenameFallback =
+    oldParsed.sections.length === visibleParsed.sections.length;
+
+  /* 접힌 사용자 태그의 이름이 바뀐 경우 새 태그를 찾는다.
+     제목 문자열을 key로만 쓰면 이름 변경 순간 old key가 사라지기 때문에
+     숨겨진 body까지 삭제되는 문제가 있었다. */
+  let editedVisibleSection = null;
+
+  if(pendingFoldedTagEdit){
+    const candidate = visibleParsed.sections[pendingFoldedTagEdit.sectionIndex];
+
+    if(
+      candidate &&
+      candidate.kind === 'custom' &&
+      Math.abs(candidate.headerStart - pendingFoldedTagEdit.headerStart) <= 8
+    ){
+      editedVisibleSection = candidate;
+    }
+  }
+
+  for(let i=0;i<visibleParsed.sections.length;i++){
+    const section = visibleParsed.sections[i];
     merged += section.header;
 
+    /* 1순위: 지금 편집 중인 접힌 |태그|.
+       새 제목의 key가 달라져도 기존 숨은 내용을 그대로 붙인다. */
+    if(
+      pendingFoldedTagEdit &&
+      editedVisibleSection === section
+    ){
+      merged += pendingFoldedTagEdit.body;
+
+      migratedFold = {
+        oldKey:pendingFoldedTagEdit.oldKey,
+        newKey:section.key
+      };
+
+      continue;
+    }
+
+    /* 2순위: beforeinput이 누락된 환경의 rename fallback.
+       섹션 개수와 시작 위치가 그대로이고, 같은 순번의 접힌 사용자 태그만
+       이름이 바뀐 경우에만 기존 body를 이어 붙인다. */
+    const oldAtIndex = oldParsed.sections[i];
+
+    if(
+      !pendingFoldedTagEdit &&
+      indexRenameFallback &&
+      oldAtIndex &&
+      oldAtIndex.kind === 'custom' &&
+      section.kind === 'custom' &&
+      collapsedKeys.has(oldAtIndex.key) &&
+      oldAtIndex.headerStart === section.headerStart &&
+      oldAtIndex.key !== section.key
+    ){
+      merged += oldAtIndex.body;
+
+      migratedFold = {
+        oldKey:oldAtIndex.key,
+        newKey:section.key
+      };
+
+      continue;
+    }
+
+    /* 일반적인 접힘은 기존 key로 숨은 body를 보존 */
     if(collapsedKeys.has(section.key) && oldMap.has(section.key)){
       merged += oldMap.get(section.key).body;
     }else{
@@ -1007,9 +1077,15 @@ function mergeVisibleIntoRaw(visibleText){
   }
 
   rawText = merged;
-  pruneCollapsedKeys();
-}
 
+  if(migratedFold){
+    collapsedKeys.delete(migratedFold.oldKey);
+    collapsedKeys.add(migratedFold.newKey);
+  }
+
+  pruneCollapsedKeys();
+  pendingFoldedTagEdit = null;
+}
 function pruneCollapsedKeys(){
   const valid = new Set(parseText(rawText).sections.map(s => s.key));
   collapsedKeys = new Set([...collapsedKeys].filter(key => valid.has(key)));
@@ -1727,6 +1803,68 @@ replaceInput.addEventListener('keydown',e => {
 });
 
 
+
+function captureFoldedCustomTagEdit(start,end,inputType){
+  pendingFoldedTagEdit = null;
+
+  if(
+    !inputType ||
+    !(inputType.startsWith('insert') || inputType.startsWith('delete'))
+  ){
+    return;
+  }
+
+  const view = buildView(rawText);
+
+  const target = view.meta.find(item => {
+    if(item.kind !== 'custom' || !item.folded) return false;
+
+    if(start === end){
+      return start >= item.headerStart && start <= item.headerEnd;
+    }
+
+    return rangesOverlap(
+      start,
+      end,
+      item.headerStart,
+      item.headerEnd
+    );
+  });
+
+  if(!target) return;
+
+  const parsed = parseText(rawText);
+  const sectionIndex = parsed.sections.findIndex(
+    section => section.key === target.key
+  );
+
+  if(sectionIndex < 0) return;
+
+  const section = parsed.sections[sectionIndex];
+
+  pendingFoldedTagEdit = {
+    oldKey:section.key,
+    oldTag:section.tag,
+    body:section.body,
+    headerStart:target.headerStart,
+    headerEnd:target.headerEnd,
+    sectionIndex
+  };
+}
+
+function foldedTagEditStillValid(visibleText){
+  if(!pendingFoldedTagEdit) return true;
+
+  const parsed = parseText(visibleText);
+  const candidate = parsed.sections[pendingFoldedTagEdit.sectionIndex];
+
+  return !!(
+    candidate &&
+    candidate.kind === 'custom' &&
+    Math.abs(candidate.headerStart - pendingFoldedTagEdit.headerStart) <= 8
+  );
+}
+
 /* ───────── 입력 ───────── */
 
 input.addEventListener('input', e => {
@@ -1735,6 +1873,20 @@ input.addEventListener('input', e => {
   const previousRaw = rawText;
   const previousSelection = input.selectionStart;
   const beforeSequence = fixedSequence(previousRaw);
+
+  /* 접힌 |태그|를 편집하면서 | | 자체를 없애버리면
+     숨은 body의 귀속 대상을 찾을 수 없으므로 그 한 번의 편집만 취소한다.
+     태그를 없애려면 먼저 펼친 뒤 삭제하면 된다. */
+  if(
+    pendingFoldedTagEdit &&
+    !foldedTagEditStillValid(input.value)
+  ){
+    rawText = previousRaw;
+    applyView(Math.min(previousSelection,buildView(rawText).text.length));
+    pendingFoldedTagEdit = null;
+    showProtectedHint('접힌 태그는 |태그| 형식을 유지해야 함');
+    return;
+  }
 
   mergeVisibleIntoRaw(input.value);
 
@@ -1746,6 +1898,7 @@ input.addEventListener('input', e => {
   if(structureChanged){
     rawText = previousRaw;
     applyView(Math.min(previousSelection,buildView(rawText).text.length));
+    pendingFoldedTagEdit = null;
     showProtectedHint();
     return;
   }
@@ -1810,12 +1963,14 @@ input.addEventListener('keydown',e => {
 input.addEventListener('beforeinput',e => {
   if(e.inputType === 'historyUndo'){
     e.preventDefault();
+    pendingFoldedTagEdit = null;
     undo();
     return;
   }
 
   if(e.inputType === 'historyRedo'){
     e.preventDefault();
+    pendingFoldedTagEdit = null;
     redo();
     return;
   }
@@ -1823,6 +1978,8 @@ input.addEventListener('beforeinput',e => {
   const start = input.selectionStart;
   const end = input.selectionEnd;
   const type = e.inputType || '';
+
+  captureFoldedCustomTagEdit(start,end,type);
 
   if(type.startsWith('delete')){
     if(deletionTouchesProtectedStructure(type,start,end)){
@@ -1887,6 +2044,7 @@ input.addEventListener('paste',e => {
 
   e.preventDefault();
 
+  pendingFoldedTagEdit = null;
   rawText = pasted;
   collapsedKeys.clear();
   lastHit.clear();
@@ -1992,6 +2150,7 @@ saveTxtBtn.addEventListener('click',() => {
 
 clearBtn.addEventListener('click',() => {
   /* 고정 카테고리는 삭제 대상이 아니므로 비우기는 카테고리 골격만 남긴다. */
+  pendingFoldedTagEdit = null;
   rawText = sample;
   collapsedKeys.clear();
   lastHit.clear();
@@ -2005,6 +2164,7 @@ clearBtn.addEventListener('click',() => {
 });
 
 homeBtn.addEventListener('click',() => {
+  pendingFoldedTagEdit = null;
   rawText = sample;
   collapsedKeys.clear();
   lastHit.clear();
@@ -2124,6 +2284,43 @@ window.__editorTest = {
   customTags:() => parseText(rawText).sections
     .filter(section => section.kind === 'custom')
     .map(section => section.tag),
+  renameFoldedCustom(oldTag,newTag,occurrence=0){
+    const parsed = parseText(rawText);
+    const candidates = parsed.sections.filter(
+      section => section.kind === 'custom' && section.tag === oldTag
+    );
+    const section = candidates[occurrence];
+    if(!section) return false;
+
+    const key = section.key;
+    collapsedKeys.add(key);
+    applyView();
+
+    const view = buildView(rawText);
+    const target = view.meta.find(item => item.key === key);
+    if(!target) return false;
+
+    input.setSelectionRange(target.headerStart,target.headerEnd);
+
+    captureFoldedCustomTagEdit(
+      target.headerStart,
+      target.headerEnd,
+      'insertText'
+    );
+
+    input.setRangeText(newTag,target.headerStart,target.headerEnd,'end');
+
+    if(!foldedTagEditStillValid(input.value)){
+      pendingFoldedTagEdit = null;
+      applyView();
+      return false;
+    }
+
+    mergeVisibleIntoRaw(input.value);
+    applyView();
+
+    return true;
+  },
   search(query){
     return findAllMatches(query);
   },
@@ -2134,6 +2331,72 @@ window.__editorTest = {
     return rawText;
   }
 };
+
+if(new URLSearchParams(location.search).get('selftest') === '1'){
+  window.addEventListener('load',() => {
+    requestAnimationFrame(() => {
+      const original = rawText;
+
+      const testBody =
+        '\n- 첫 번째 숨은 내용\n- 두 번째 숨은 내용\n본문 {{user}}\n';
+
+      const testText =
+        sample.replace(
+          '[코멘트]',
+          '|소제목|' + testBody + '[코멘트]'
+        );
+
+      window.__editorTest.setRaw(testText);
+      const before = window.__editorTest.getRaw();
+
+      const renamed = window.__editorTest.renameFoldedCustom(
+        '|소제목|',
+        '|수정된 소제목|'
+      );
+
+      const after = window.__editorTest.getRaw();
+      const foldedKeys = window.__editorTest.getCollapsed();
+
+      const bodyPreserved =
+        after.includes(testBody);
+
+      const titleChanged =
+        after.includes('|수정된 소제목|') &&
+        !after.includes('|소제목|');
+
+      const foldMigrated =
+        foldedKeys.some(key => key.includes('|수정된 소제목|')) &&
+        !foldedKeys.some(key => key.includes('|소제목|'));
+
+      /* 다시 펼친 뒤 실제 화면에도 본문이 돌아오는지 확인 */
+      window.__editorTest.fold('|수정된 소제목|',0);
+      const visibleAfterUnfold = window.__editorTest.getView();
+      const unfoldShowsBody = visibleAfterUnfold.includes(testBody.trim());
+
+      const result = {
+        renamed,
+        bodyPreserved,
+        titleChanged,
+        foldMigrated,
+        unfoldShowsBody,
+        pass:
+          renamed &&
+          bodyPreserved &&
+          titleChanged &&
+          foldMigrated &&
+          unfoldShowsBody
+      };
+
+      window.__editorTest.setRaw(original);
+
+      const pre = document.createElement('pre');
+      pre.id = '__selftest_result';
+      pre.textContent = JSON.stringify(result);
+      document.body.appendChild(pre);
+    });
+  });
+}
+
 </script>
 </body>
 </html>
